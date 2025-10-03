@@ -11,3 +11,10 @@ rapidfuzz>=3.8.1
 fastapi>=0.111.0
 uvicorn[standard]>=0.30.0
 kaleido
+langchain_openai
+langchain_community
+sqlparse
+plotly
+langgraph.checkpoint.postgres
+psycopg_binary
+langgraph.checkpoint.sqlite
