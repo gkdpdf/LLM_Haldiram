@@ -3,8 +3,10 @@ import re
 from openai import OpenAI
 from rapidfuzz import process, fuzz
 from datetime import datetime, timedelta
-from typing import TypedDict, List, Dict, Any,Optional
+from typing import TypedDict, List, Dict, Any, Optional
 from dotenv import load_dotenv
+import psycopg2
+
 load_dotenv() 
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -16,6 +18,23 @@ def normalize(t):
 def detect_time_filters(user_query: str):
     query = user_query.lower()
     today = datetime.today().date()
+    
+    # Month detection
+    months = {
+        'january': 1, 'jan': 1, 'february': 2, 'feb': 2, 'march': 3, 'mar': 3,
+        'april': 4, 'apr': 4, 'may': 5, 'june': 6, 'jun': 6,
+        'july': 7, 'jul': 7, 'august': 8, 'aug': 8, 'september': 9, 'sep': 9,
+        'october': 10, 'oct': 10, 'november': 11, 'nov': 11, 'december': 12, 'dec': 12
+    }
+    
+    for month_name, month_num in months.items():
+        if month_name in query:
+            year = today.year
+            return {
+                "time_range": [f"{year}-{month_num:02d}-01", f"{year}-{month_num:02d}-31"],
+                "month": month_num
+            }
+    
     if "last 2 months" in query:
         return {"time_range": [str(today - timedelta(days=60)), str(today)]}
     if "last 3 months" in query:
@@ -24,6 +43,7 @@ def detect_time_filters(user_query: str):
         return {"time_range": [str(today - timedelta(days=30)), str(today)]}
     if "last week" in query:
         return {"time_range": [str(today - timedelta(days=7)), str(today)]}
+    
     return {}
 
 def shortlist_candidates_with_scores(text, options, k=15, score_cutoff=60):
@@ -68,28 +88,59 @@ You are a business query analyzer.
 2. If relevant, extract:
    - intent (query|aggregation|ranking|comparison)
    - metrics (sales, revenue, quantity, etc.)
-   - entities: Extract COMPLETE entity names, don't split them.
+   - entities: Extract COMPLETE entity names as a dictionary, don't split them.
 
 Examples:
-- "VH trading" → {{"distributor": ["VH trading"]}}
-- "takatak" → {{"product": ["takatak"]}}
-- "Samsung Galaxy S21" → {{"product": ["Samsung Galaxy S21"]}}
+- "VH trading" → {{"intent": "query", "entities": {{"distributor": ["VH trading"]}}, "metrics": []}}
+- "takatak" → {{"intent": "query", "entities": {{"product": ["takatak"]}}, "metrics": []}}
+- "sales in may" → {{"intent": "query", "entities": {{}}, "metrics": ["sales"]}}
+
+IMPORTANT: ALWAYS include "intent", "metrics", and "entities" keys in your response.
 
 User query:
 ```{user_query}```
 
-Return JSON only with complete entity names.
+Return ONLY valid JSON with all required keys: intent, metrics, entities.
     """
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[{"role": "system", "content": "Return only JSON with complete entity names."},
+        messages=[{"role": "system", "content": "Return only valid JSON with intent, metrics, and entities keys."},
                   {"role": "user", "content": prompt}],
         temperature=0
     )
     try:
-        return eval(resp.choices[0].message.content)
-    except:
-        return {"intent": "irrelevant", "metrics": [], "entities": {}}
+        content = resp.choices[0].message.content.strip()
+        # Remove markdown code blocks if present
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0].strip()
+        elif "```" in content:
+            content = content.split("```")[1].split("```")[0].strip()
+        
+        result = eval(content)
+        
+        # Ensure all required keys exist with defaults
+        if "intent" not in result:
+            result["intent"] = "query"
+        if "metrics" not in result:
+            result["metrics"] = []
+        if "entities" not in result:
+            result["entities"] = {}
+        
+        # Ensure entities is always a dict
+        if not isinstance(result["entities"], dict):
+            print(f"⚠️ Converting entities from {type(result['entities'])} to dict")
+            result["entities"] = {}
+        
+        # Ensure metrics is always a list
+        if not isinstance(result["metrics"], list):
+            result["metrics"] = [result["metrics"]] if result["metrics"] else []
+        
+        print(f"✅ LLM parsed: intent={result['intent']}, metrics={result['metrics']}, entities={list(result['entities'].keys())}")
+        
+        return result
+    except Exception as e:
+        print(f"⚠️ LLM parsing error: {e}, using defaults")
+        return {"intent": "query", "metrics": [], "entities": {}}
 
 # ---------- Entity Resolution ----------
 def resolve_entity_with_disambiguation(entity_value, catalog, table_columns):
@@ -151,26 +202,51 @@ def resolve_entity_with_disambiguation(entity_value, catalog, table_columns):
 # ---------- Main Resolver ----------
 def resolve_with_human_in_loop_pg(user_query, catalog, table_columns):
     parsed = llm_understand(user_query)
-
-    if parsed["intent"] == "irrelevant":
-        print("🙅 This question doesn't relate to products, distributors, or sales in the DB.")
-        return {"intent": "irrelevant"}
-
+    
+    # Safe access to intent with default
     intent = parsed.get("intent", "query")
+
+    if intent == "irrelevant":
+        print("🙅 This question doesn't relate to products, distributors, or sales in the DB.")
+        return {
+            "intent": "irrelevant",
+            "metrics": [],
+            "entities": {},
+            "filters": {},
+            "table": None,
+            "columns": []
+        }
+
     metrics = parsed.get("metrics", [])
     entities = parsed.get("entities", {})
+    
+    # CRITICAL FIX: Ensure entities is always a dict
+    if not isinstance(entities, dict):
+        print(f"⚠️ Warning: entities was {type(entities)}, converting to dict")
+        entities = {}
+    
     filters = detect_time_filters(user_query)
+    
+    print(f"📝 Query intent: {intent}, metrics: {metrics}, filters: {filters}")
 
     resolved_entities = {}
-    for entity_type, values in entities.items():
-        if not values:
-            continue
-        print(f"\n🔍 Resolving entity: '{values[0]}'")
-        result = resolve_entity_with_disambiguation(values[0], catalog, table_columns)
-        if result.get("status") != "not found":
-            resolved_entities[entity_type] = result
+    
+    # Only try to resolve if entities exist
+    if entities:
+        for entity_type, values in entities.items():
+            if not values:
+                continue
+            # Handle both list and single values
+            entity_value = values[0] if isinstance(values, list) else values
+            print(f"\n🔍 Resolving entity: '{entity_value}'")
+            result = resolve_entity_with_disambiguation(entity_value, catalog, table_columns)
+            if result.get("status") != "not found":
+                resolved_entities[entity_type] = result
+    else:
+        print("ℹ️ No entities detected in query")
 
-    # Ask user for table if not clear
+    # Determine table
+    table = None
     if "sales" in metrics and not any(tbl in user_query.lower() for tbl in ["primary", "shipment"]):
         print("\n❓ 'Sales' found. Do you mean:")
         print("  1. tbl_primary")
@@ -182,35 +258,40 @@ def resolve_with_human_in_loop_pg(user_query, catalog, table_columns):
                     table = "tbl_primary" if choice == 1 else "tbl_shipment"
                     break
             except ValueError:
-                pass
+                print("Invalid input. Please enter 1 or 2.")
+    elif resolved_entities:
+        table = next(iter(resolved_entities.values())).get("table")
     else:
-        if resolved_entities:
-            table = next(iter(resolved_entities.values())).get("table")
-        else:
-            print("\n📊 Which table do you want to query?")
-            for i, t in enumerate(table_columns.keys(), 1):
-                print(f"  {i}. {t}")
-            while True:
-                try:
-                    choice = int(input(f"Select table (1-{len(table_columns)}): "))
-                    if 1 <= choice <= len(table_columns):
-                        table = list(table_columns.keys())[choice-1]
-                        break
-                except ValueError:
-                    pass
+        # Default table selection
+        print("\n📊 Which table do you want to query?")
+        available_tables = list(table_columns.keys())
+        for i, t in enumerate(available_tables, 1):
+            print(f"  {i}. {t}")
+        while True:
+            try:
+                choice = int(input(f"Select table (1-{len(available_tables)}): "))
+                if 1 <= choice <= len(available_tables):
+                    table = available_tables[choice-1]
+                    break
+            except ValueError:
+                print(f"Invalid input. Please enter a number between 1 and {len(available_tables)}.")
 
+    # Determine columns
     candidate_cols = [ent["column"] for ent in resolved_entities.values() if "column" in ent]
-    candidate_cols = list(dict.fromkeys(candidate_cols)) if candidate_cols else list(table_columns[table])
+    candidate_cols = list(dict.fromkeys(candidate_cols)) if candidate_cols else list(table_columns.get(table, []))
 
-    print(f"\n📊 Candidate columns in {table}:")
-    for i, col in enumerate(candidate_cols, 1):
-        print(f"  {i}. {col}")
-    cols_input = input("Select columns by number (comma separated, or Enter for auto): ")
-    if cols_input.strip():
-        col_indices = [int(x.strip()) for x in cols_input.split(",") if x.strip().isdigit()]
-        selected_cols = [candidate_cols[i-1] for i in col_indices if 1 <= i <= len(candidate_cols)]
+    if candidate_cols:
+        print(f"\n📊 Candidate columns in {table}:")
+        for i, col in enumerate(candidate_cols, 1):
+            print(f"  {i}. {col}")
+        cols_input = input("Select columns by number (comma separated, or Enter for auto): ")
+        if cols_input.strip():
+            col_indices = [int(x.strip()) for x in cols_input.split(",") if x.strip().isdigit()]
+            selected_cols = [candidate_cols[i-1] for i in col_indices if 1 <= i <= len(candidate_cols)]
+        else:
+            selected_cols = candidate_cols
     else:
-        selected_cols = candidate_cols
+        selected_cols = []
 
     return {
         "intent": intent,
@@ -221,8 +302,6 @@ def resolve_with_human_in_loop_pg(user_query, catalog, table_columns):
         "columns": selected_cols
     }
 
-
-import psycopg2
 
 def build_catalog(conn, table_columns, max_values=50):
     """
@@ -246,15 +325,6 @@ def build_catalog(conn, table_columns, max_values=50):
     return catalog
 
 
-conn = psycopg2.connect(
-    host="localhost",
-    dbname="haldiram",
-    user="postgres",
-    password="12345678"
-)
-
-import psycopg2
-
 def load_table_columns_pg(conn, tables):
     """
     Load column names for given tables from PostgreSQL.
@@ -272,33 +342,6 @@ def load_table_columns_pg(conn, tables):
             cols = [row[0] for row in cur.fetchall()]
             table_columns[table] = cols
     return table_columns
-
-
-# ---------- Example usage ----------
-conn = psycopg2.connect(
-    host="localhost",
-    dbname="haldiram",
-    user="postgres",
-    password="12345678"
-)
-
-# load multiple tables
-tables_to_load = ["tbl_shipment", "tbl_primary", "tbl_product_master"]
-table_columns = load_table_columns_pg(conn, tables_to_load)
-
-# print("\n📊 Table Columns Loaded:")
-# for tbl, cols in table_columns.items():
-#     print(f"{tbl}: {cols}")
-
-table_columns = load_table_columns_pg(conn, ["tbl_shipment", "tbl_primary","tbl_product_master"])
-# print(table_columns)
-
-# Get table + column structure
-table_columns = load_table_columns_pg(conn, ["tbl_shipment", "tbl_primary", "tbl_product_master"])
-
-# Build the catalog with actual values
-catalog = build_catalog(conn, table_columns)
-
 
 
 class GraphState(TypedDict, total=False):
