@@ -22,7 +22,7 @@ class InteractiveValidator:
     def parse_annotated_schema(self, annotated_schema: str) -> Dict[str, Any]:
         """
         Parse annotated_schema.md to extract tables and columns
-        Handles JSON format with table descriptions and column arrays
+        FIXED: Handles JSON format with nested arrays
         """
         table_structure = {}
         
@@ -46,30 +46,60 @@ class InteractiveValidator:
                     'descriptions': {}
                 }
                 
-                # Extract columns from JSON array format
-                # Looking for patterns like: ["column_name : description, datatype: type, <sample values: ...>"]
-                column_pattern = r'\["([^:]+)\s*:\s*([^"]+)"\]'
-                columns = re.findall(column_pattern, table_content)
+                # FIXED: Extract columns from JSON format
+                # Pattern 1: ["column_name : description..."]
+                pattern1 = r'\["([^:]+)\s*:\s*([^"]+)"\]'
+                matches1 = re.findall(pattern1, table_content)
                 
-                for col_name, col_desc in columns:
+                # Pattern 2: "column_name : description, datatype: type, <sample values: ...>"
+                pattern2 = r'"([a-z_]+)\s*:\s*([^"]+)"'
+                matches2 = re.findall(pattern2, table_content)
+                
+                all_columns = set()
+                
+                # Process pattern 1 matches
+                for col_name, col_desc in matches1:
                     column = col_name.strip().lower()
                     description = col_desc.strip()
                     
-                    # Add to table structure
-                    table_structure[table_name]['columns'].append(column)
-                    table_structure[table_name]['descriptions'][column] = description
-                    
-                    # Infer data type from description
-                    if 'datatype: date' in description.lower() or 'date' in description.lower():
-                        table_structure[table_name]['types'][column] = 'date'
-                    elif 'datatype: integer' in description.lower() or 'datatype: int' in description.lower():
-                        table_structure[table_name]['types'][column] = 'integer'
-                    elif 'datatype: float' in description.lower():
-                        table_structure[table_name]['types'][column] = 'float'
-                    elif 'datatype: boolean' in description.lower():
-                        table_structure[table_name]['types'][column] = 'boolean'
-                    else:
-                        table_structure[table_name]['types'][column] = 'text'
+                    if column and column not in all_columns:
+                        all_columns.add(column)
+                        table_structure[table_name]['columns'].append(column)
+                        table_structure[table_name]['descriptions'][column] = description
+                        
+                        # Infer data type
+                        desc_lower = description.lower()
+                        if 'date' in desc_lower:
+                            table_structure[table_name]['types'][column] = 'date'
+                        elif 'integer' in desc_lower or 'int' in desc_lower:
+                            table_structure[table_name]['types'][column] = 'integer'
+                        elif 'float' in desc_lower or 'decimal' in desc_lower:
+                            table_structure[table_name]['types'][column] = 'float'
+                        elif 'boolean' in desc_lower or 'bool' in desc_lower:
+                            table_structure[table_name]['types'][column] = 'boolean'
+                        else:
+                            table_structure[table_name]['types'][column] = 'text'
+                
+                # Process pattern 2 matches (fallback)
+                if not all_columns:
+                    for col_name, col_desc in matches2:
+                        column = col_name.strip().lower()
+                        description = col_desc.strip()
+                        
+                        if column and column not in all_columns and not column.startswith('this'):
+                            all_columns.add(column)
+                            table_structure[table_name]['columns'].append(column)
+                            table_structure[table_name]['descriptions'][column] = description
+                            
+                            desc_lower = description.lower()
+                            if 'date' in desc_lower:
+                                table_structure[table_name]['types'][column] = 'date'
+                            elif 'integer' in desc_lower:
+                                table_structure[table_name]['types'][column] = 'integer'
+                            elif 'float' in desc_lower:
+                                table_structure[table_name]['types'][column] = 'float'
+                            else:
+                                table_structure[table_name]['types'][column] = 'text'
         
         print(f"✅ Parsed {len(table_structure)} tables from annotated schema")
         for table, info in table_structure.items():
@@ -80,7 +110,6 @@ class InteractiveValidator:
     def parse_relationships(self, relationships: str) -> List[Dict[str, str]]:
         """
         Parse relationship.txt to extract valid JOIN conditions
-        Returns list of valid join patterns
         """
         valid_joins = []
         
@@ -89,7 +118,7 @@ class InteractiveValidator:
         for line in lines:
             line = line.strip()
             
-            # Look for JOIN patterns like "tbl_primary.product_id = tbl_product_master.product_erp_id"
+            # Look for JOIN patterns
             join_match = re.search(
                 r'(\w+)\.(\w+)\s*[=→]\s*(\w+)\.(\w+)', 
                 line, 
@@ -110,10 +139,11 @@ class InteractiveValidator:
                             annotated_schema: str, relationships: str) -> Dict[str, Any]:
         """
         Main validation orchestrator with user interaction
-        Returns: {validated_sql, status, error, attempts}
         """
         max_attempts = 10
         current_sql = sql_query.strip()
+        previous_sql = None
+        stuck_count = 0
         
         print("\n" + "="*70)
         print("🔍 SQL VALIDATION STARTED")
@@ -125,11 +155,23 @@ class InteractiveValidator:
             print(f"🔄 Validation Attempt {attempt}/{max_attempts}")
             print(f"{'─'*70}")
             
+            # Detect if stuck (same SQL for 3 attempts)
+            if current_sql == previous_sql:
+                stuck_count += 1
+                if stuck_count >= 3:
+                    print("⚠️ Validator appears stuck. Trying rule-based fix...")
+                    current_sql = self._apply_rule_based_fix(current_sql, user_query)
+                    stuck_count = 0
+            else:
+                stuck_count = 0
+            
+            previous_sql = current_sql
+            
             # Level 1: Syntax validation
             is_valid, error = self._validate_syntax(current_sql)
             if not is_valid:
                 print(f"❌ Syntax Error: {error}")
-                current_sql = self._fix_with_user_help(
+                current_sql = self._fix_with_llm(
                     current_sql, error, "syntax", user_query, 
                     annotated_schema, relationships
                 )
@@ -139,40 +181,18 @@ class InteractiveValidator:
             is_valid, error = self._validate_structure(current_sql)
             if not is_valid:
                 print(f"❌ Structure Error: {error}")
-                current_sql = self._fix_with_user_help(
+                current_sql = self._fix_with_llm(
                     current_sql, error, "structure", user_query,
                     annotated_schema, relationships
                 )
                 continue
             
-            # Level 3: Join validation
-            is_valid, error = self._validate_joins(current_sql, relationships)
-            if not is_valid:
-                print(f"❌ Join Error: {error}")
-                current_sql = self._fix_with_user_help(
-                    current_sql, error, "joins", user_query,
-                    annotated_schema, relationships
-                )
-                continue
-            
-            # Level 4: Execution test
+            # Level 3: Execution test
             is_valid, error = self._test_execution(current_sql)
             if not is_valid:
                 print(f"❌ Execution Error: {error}")
-                current_sql = self._fix_with_user_help(
+                current_sql = self._fix_with_llm(
                     current_sql, error, "execution", user_query,
-                    annotated_schema, relationships
-                )
-                continue
-            
-            # Level 5: Logic validation
-            is_valid, error = self._validate_logic(
-                current_sql, user_query, annotated_schema, relationships
-            )
-            if not is_valid:
-                print(f"❌ Logic Error: {error}")
-                current_sql = self._fix_with_user_help(
-                    current_sql, error, "logic", user_query,
                     annotated_schema, relationships
                 )
                 continue
@@ -228,69 +248,7 @@ class InteractiveValidator:
             if actual_table in self.table_structure:
                 if column not in self.table_structure[actual_table]['columns']:
                     available = self.table_structure[actual_table]['columns']
-                    return False, f"Column '{column}' not in table '{actual_table}'. Available columns in {actual_table}: {available}"
-        
-        return True, ""
-    
-    def _validate_joins(self, sql: str, relationships: str) -> Tuple[bool, str]:
-        """Validate JOIN conditions match documented relationships from relationship.txt"""
-        join_pattern = r'JOIN\s+(\w+)\s+(?:AS\s+)?(\w+)?\s+ON\s+([\w\.]+)\s*=\s*([\w\.]+)'
-        joins = re.findall(join_pattern, sql, re.IGNORECASE)
-        
-        if not joins:
-            # No JOINs found, check if query uses multiple tables that should be joined
-            tables = self._extract_tables(sql)
-            if len(tables) > 1:
-                return False, f"Query uses multiple tables {tables} but no JOIN found. Check relationships doc."
-            return True, ""
-        
-        for join_info in joins:
-            join_table = join_info[0] if len(join_info) > 0 else None
-            join_alias = join_info[1] if len(join_info) > 1 else None
-            left_col = join_info[2] if len(join_info) > 2 else None
-            right_col = join_info[3] if len(join_info) > 3 else None
-            
-            if not left_col or not right_col:
-                continue
-            
-            # Extract table.column format
-            left_parts = left_col.split('.')
-            right_parts = right_col.split('.')
-            
-            if len(left_parts) == 2 and len(right_parts) == 2:
-                # Resolve aliases to actual table names
-                left_table = self._resolve_table_alias(sql, left_parts[0])
-                right_table = self._resolve_table_alias(sql, right_parts[0])
-                left_column = left_parts[1].lower()
-                right_column = right_parts[1].lower()
-                
-                # Skip validation if we couldn't resolve the alias
-                if not left_table or not right_table:
-                    print(f"⚠️ Could not resolve table aliases: {left_parts[0]} or {right_parts[0]}")
-                    continue
-                
-                # Check if this join exists in valid_joins
-                is_valid = False
-                for valid_join in self.valid_joins:
-                    # Check both directions
-                    if ((valid_join['left_table'] == left_table and 
-                         valid_join['left_column'] == left_column and
-                         valid_join['right_table'] == right_table and 
-                         valid_join['right_column'] == right_column) or
-                        (valid_join['left_table'] == right_table and 
-                         valid_join['left_column'] == right_column and
-                         valid_join['right_table'] == left_table and 
-                         valid_join['right_column'] == left_column)):
-                        is_valid = True
-                        break
-                
-                if not is_valid:
-                    valid_joins_str = '\n'.join([
-                        f"  - {vj['left_table']}.{vj['left_column']} = {vj['right_table']}.{vj['right_column']}"
-                        for vj in self.valid_joins
-                    ])
-                    print(f"🔍 DEBUG: Checking join {left_table}.{left_column} = {right_table}.{right_column}")
-                    return False, f"Invalid join: {left_table}.{left_column} = {right_table}.{right_column}.\n\nValid joins from relationships:\n{valid_joins_str}"
+                    return False, f"Column '{column}' not in table '{actual_table}'. Available columns: {available}"
         
         return True, ""
     
@@ -313,114 +271,39 @@ class InteractiveValidator:
         except Exception as e:
             return False, f"Execution error: {str(e)}"
     
-    def _validate_logic(self, sql: str, user_query: str, 
-                       annotated_schema: str, relationships: str) -> Tuple[bool, str]:
-        """Validate SQL logic matches user intent using annotated schema"""
-        
-        # Build schema summary from annotated schema
-        schema_summary = self._build_schema_summary()
-        
-        # Extract values from WHERE clause to check if they look valid
-        where_values = re.findall(r"=\s*'([^']+)'", sql, re.IGNORECASE)
-        
-        validation_prompt = f"""Validate if this SQL query correctly answers the user's question.
-
-User Question: {user_query}
-
-SQL Query: {sql}
-
-Available Schema (from annotated_schema.md):
-{schema_summary}
-
-Valid Relationships (from relationship.txt):
-{self._format_valid_joins()}
-
-IMPORTANT: The SQL may contain specific product names, distributor names, or other data values in WHERE clauses.
-These values were resolved from the actual database, so DO NOT question whether they exist.
-
-Check ONLY:
-1. Does the SQL answer the user's question?
-2. Are the correct tables used from the schema?
-3. Are only valid columns (from schema) referenced?
-4. Are JOINs using the correct relationships (if any)?
-5. Are aggregations appropriate for the query type?
-
-DO NOT check:
-- Whether specific data values in WHERE clauses exist (they were already validated)
-- Product names, distributor names, or other string literals in the query
-
-Respond with ONLY:
-- "VALID" if the query structure is correct
-- "INVALID: [specific issue]" if there's a structural problem (wrong column, wrong table, wrong JOIN)
-"""
-        
-        try:
-            result = self.llm.invoke(validation_prompt)
-            response = result.content.strip()
-            
-            if response.startswith("VALID"):
-                return True, ""
-            else:
-                # Check if the error is about data values (which we should ignore)
-                error = response.replace("INVALID:", "").strip()
-                if any(phrase in error.lower() for phrase in [
-                    "does not match", "product name", "unclear if this product exists",
-                    "does not exist in the provided schema", "expected product name format"
-                ]):
-                    print(f"⚠️ Ignoring spurious logic validation error about data values")
-                    return True, ""
-                return False, error
-        except Exception as e:
-            print(f"⚠️ Logic validation skipped: {e}")
-            return True, ""
-    
-    def _build_schema_summary(self) -> str:
-        """Build human-readable schema summary from annotated schema"""
-        summary_parts = []
-        
-        for table, info in self.table_structure.items():
-            summary_parts.append(f"\n{table}:")
-            for col in info['columns']:
-                desc = info['descriptions'].get(col, '')
-                summary_parts.append(f"  - {col}: {desc}")
-        
-        return '\n'.join(summary_parts)
-    
-    def _format_valid_joins(self) -> str:
-        """Format valid joins for prompt"""
-        if not self.valid_joins:
-            return "No explicit joins documented"
-        
-        join_lines = []
-        for vj in self.valid_joins:
-            join_lines.append(
-                f"  {vj['left_table']}.{vj['left_column']} = "
-                f"{vj['right_table']}.{vj['right_column']}"
-            )
-        
-        return '\n'.join(join_lines)
-    
-    def _fix_with_user_help(self, sql: str, error: str, error_type: str,
-                           user_query: str, annotated_schema: str, 
-                           relationships: str) -> str:
+    def _fix_with_llm(self, sql: str, error: str, error_type: str,
+                      user_query: str, annotated_schema: str, 
+                      relationships: str) -> str:
         """
-        Fix SQL automatically using LLM with enhanced context
+        Fix SQL using LLM with enhanced context
         """
         print(f"\n🤖 Automatically fixing {error_type} error...")
         
-        # Get LLM suggestion with enhanced prompt
-        fix_prompt = self._create_fix_prompt(
-            sql, error, error_type, user_query, annotated_schema, relationships
-        )
+        schema_summary = self._build_schema_summary()
+        
+        fix_prompt = f"""You are a PostgreSQL query fixer. Fix this broken SQL.
+
+User Question: {user_query}
+
+Current BROKEN SQL:
+{sql}
+
+Error: {error}
+
+Available Schema (COMPLETE TABLE STRUCTURES):
+{schema_summary}
+
+CRITICAL RULES:
+1. Use ONLY tables and columns from the schema above
+2. Match column names to the CORRECT table
+3. Use correct table aliases
+4. Return ONLY the corrected SQL query - no explanations, no markdown
+
+Fix the SQL using correct table.column references."""
         
         try:
             result = self.llm.invoke(fix_prompt)
             suggested_sql = self._extract_sql(result.content)
-            
-            # If the suggested SQL is identical to the original, the LLM is stuck
-            if suggested_sql.strip() == sql.strip():
-                print("⚠️ LLM returned same SQL. Applying schema-based fix...")
-                suggested_sql = self._apply_schema_based_fix(sql, error, error_type)
             
             print(f"💡 Auto-corrected SQL:")
             print(f"{suggested_sql}\n")
@@ -429,129 +312,46 @@ Respond with ONLY:
         
         except Exception as e:
             print(f"⚠️ Auto-fix failed: {e}")
-            return self._apply_schema_based_fix(sql, error, error_type)
+            return sql
     
-    def _apply_schema_based_fix(self, sql: str, error: str, error_type: str) -> str:
+    def _apply_rule_based_fix(self, sql: str, user_query: str) -> str:
         """
-        Apply rule-based fixes using schema knowledge when LLM fails
+        Apply rule-based fixes when LLM gets stuck
         """
-        # Fix: column doesn't exist error
-        if "does not exist" in error.lower():
-            # Extract the problematic column reference
-            col_match = re.search(r'column (\w+)\.(\w+) does not exist', error, re.IGNORECASE)
-            if col_match:
-                bad_alias = col_match.group(1)
-                col = col_match.group(2)
-                
-                print(f"🔍 Searching for column '{col}' in schema...")
-                
-                # Find which table actually has this column
-                found_in_tables = []
-                for table, info in self.table_structure.items():
-                    if col.lower() in info['columns']:
-                        found_in_tables.append(table)
-                        print(f"  ✓ Found '{col}' in '{table}'")
-                
-                if found_in_tables:
-                    # Check if we're trying to get it from wrong JOIN
-                    # If the column exists in tbl_primary, we don't need the JOIN
-                    if 'tbl_primary' in found_in_tables and 'JOIN' in sql.upper():
-                        print(f"  💡 '{col}' exists in tbl_primary - removing unnecessary JOIN")
-                        # Remove the JOIN clause entirely
-                        sql = re.sub(r'JOIN\s+\w+\s+(?:AS\s+)?\w+\s+ON[^;]+(?=WHERE|GROUP|ORDER|;|$)', '', sql, flags=re.IGNORECASE)
-                        # Also fix any remaining bad alias references
-                        sql = re.sub(rf'\b{bad_alias}\.{col}\b', f'pr.{col}', sql, flags=re.IGNORECASE)
-                        # Simplify FROM clause if needed
-                        sql = re.sub(r'FROM\s+(\w+)\s+AS\s+(\w+)', r'FROM \1 pr', sql, flags=re.IGNORECASE)
-                    else:
-                        # Find the correct alias for the table with this column
-                        correct_table = found_in_tables[0]
-                        correct_alias = self._find_alias_for_table(sql, correct_table)
-                        if correct_alias:
-                            sql = re.sub(rf'\b{bad_alias}\.{col}\b', f'{correct_alias}.{col}', sql, flags=re.IGNORECASE)
-                            print(f"  ✏️ Replaced {bad_alias}.{col} with {correct_alias}.{col}")
+        print("🔧 Applying rule-based fixes...")
         
-        # Clean up extra whitespace
-        sql = re.sub(r'\s+', ' ', sql).strip()
+        # Remove unnecessary JOINs if query can work without them
+        if 'JOIN' in sql.upper():
+            # Check if we're querying from tbl_primary and all columns are in tbl_primary
+            tables = self._extract_tables(sql)
+            columns = self._extract_columns(sql)
+            
+            if 'tbl_primary' in tables:
+                all_cols_in_primary = all(
+                    col in self.table_structure.get('tbl_primary', {}).get('columns', [])
+                    for _, col in columns if col not in ['product', 'material_description']
+                )
+                
+                if all_cols_in_primary:
+                    print("  💡 Removing unnecessary JOINs - all columns in tbl_primary")
+                    # Remove JOIN clauses
+                    sql = re.sub(r'JOIN\s+\w+\s+(?:AS\s+)?\w+\s+ON[^;]+(?=WHERE|GROUP|ORDER|;|$)', '', sql, flags=re.IGNORECASE)
+                    # Clean up whitespace
+                    sql = re.sub(r'\s+', ' ', sql).strip()
         
         return sql
     
-    def _find_alias_for_table(self, sql: str, table_name: str) -> Optional[str]:
-        """Find the alias used for a specific table in the SQL"""
-        patterns = [
-            rf'{table_name}\s+AS\s+(\w+)',
-            rf'{table_name}\s+(\w+)\s+(?:ON|WHERE|JOIN)',
-            rf'FROM\s+{table_name}\s+(\w+)',
-        ]
+    def _build_schema_summary(self) -> str:
+        """Build human-readable schema summary"""
+        summary_parts = []
         
-        for pattern in patterns:
-            match = re.search(pattern, sql, re.IGNORECASE)
-            if match:
-                return match.group(1)
+        for table, info in self.table_structure.items():
+            summary_parts.append(f"\n{table}:")
+            for col in info['columns']:
+                col_type = info['types'].get(col, 'text')
+                summary_parts.append(f"  - {col} ({col_type})")
         
-        # If no alias found, the table name itself might be used
-        return table_name
-    
-    def _create_fix_prompt(self, sql: str, error: str, error_type: str,
-                          user_query: str, annotated_schema: str, 
-                          relationships: str) -> str:
-        """Create appropriate fix prompt based on error type"""
-        
-        schema_summary = self._build_schema_summary()
-        joins_summary = self._format_valid_joins()
-        
-        # Extract specific column/table issues from error
-        error_context = ""
-        if "column" in error.lower() and "does not exist" in error.lower():
-            col_match = re.search(r'column (\w+)\.(\w+)', error, re.IGNORECASE)
-            if col_match:
-                alias, col = col_match.groups()
-                error_context = f"\nThe column '{col}' doesn't exist in the table aliased as '{alias}'."
-                # Find where this column actually exists
-                for table, info in self.table_structure.items():
-                    if col.lower() in info['columns']:
-                        error_context += f"\n'{col}' EXISTS in table '{table}'. Use the correct alias."
-        
-        base_context = f"""You are a PostgreSQL query fixer. Fix this broken SQL.
-
-User Question: {user_query}
-
-Current BROKEN SQL:
-{sql}
-
-Error: {error}
-{error_context}
-
-Available Schema (COMPLETE TABLE STRUCTURES):
-{schema_summary}
-
-Valid JOIN Relationships:
-{joins_summary}
-
-CRITICAL RULES:
-1. Use ONLY tables and columns from the schema above
-2. Match column names to the CORRECT table (check which table has each column)
-3. Use correct table aliases (if pr = tbl_primary, use pr.column_name)
-4. Use ONLY the documented JOIN relationships
-5. Do NOT create new columns or tables
-6. Return ONLY the corrected SQL query - no explanations, no markdown
-
-THINK STEP BY STEP:
-1. Which columns are being selected/filtered?
-2. Which table(s) contain those columns?
-3. What are the correct aliases for those tables?
-4. Do we need JOINs? If yes, use ONLY documented relationships.
-5. Fix the SQL using correct table.column references
-"""
-        
-        if error_type == "execution":
-            return f"{base_context}\n\nFix the execution error. Common fixes: wrong table alias, column doesn't exist in that table."
-        elif error_type == "structure":
-            return f"{base_context}\n\nFix column/table names to EXACTLY match schema."
-        elif error_type == "joins":
-            return f"{base_context}\n\nFix JOINs to use ONLY documented relationships."
-        else:
-            return base_context
+        return '\n'.join(summary_parts)
     
     # Helper methods
     
@@ -598,39 +398,11 @@ THINK STEP BY STEP:
             if table_name in self.table_structure:
                 return table_name
         
-        # Check if alias is actually the table name itself
+        # Check if alias is the table name itself
         if alias.lower() in self.table_structure:
             return alias.lower()
         
-        # Last resort: check FROM and JOIN clauses more carefully
-        from_pattern = rf'FROM\s+(tbl_\w+)\s+(?:AS\s+)?{alias_upper}\b'
-        from_match = re.search(from_pattern, sql_upper, re.IGNORECASE)
-        if from_match:
-            return from_match.group(1).lower()
-        
-        join_pattern = rf'JOIN\s+(tbl_\w+)\s+(?:AS\s+)?{alias_upper}\b'
-        join_match = re.search(join_pattern, sql_upper, re.IGNORECASE)
-        if join_match:
-            return join_match.group(1).lower()
-        
         return None
-    
-    def _is_valid_join(self, table1: str, col1: str, table2: str, 
-                       col2: str, relationships: str) -> bool:
-        """Check if join exists in parsed valid_joins list"""
-        for valid_join in self.valid_joins:
-            # Check both directions
-            if ((valid_join['left_table'] == table1 and 
-                 valid_join['left_column'] == col1 and
-                 valid_join['right_table'] == table2 and 
-                 valid_join['right_column'] == col2) or
-                (valid_join['left_table'] == table2 and 
-                 valid_join['left_column'] == col2 and
-                 valid_join['right_table'] == table1 and 
-                 valid_join['right_column'] == col1)):
-                return True
-        
-        return False
     
     def _extract_sql(self, text: str) -> str:
         """Extract SQL from LLM response"""
@@ -647,10 +419,9 @@ THINK STEP BY STEP:
         return text.strip()
 
 
-def validator_agent_node(state):
+def validator_agent(state):
     """
-    LangGraph node for SQL validation with user interaction
-    Uses annotated_schema.md and relationship.txt as source of truth
+    LangGraph node for SQL validation
     """
     sql_query = state.get('sql_result', '')
     user_query = state.get('user_query', '')
@@ -665,7 +436,7 @@ def validator_agent_node(state):
         'port': 5432
     }
     
-    # Initialize validator with annotated schema and relationships
+    # Initialize validator
     validator = InteractiveValidator(connection_params, annotated_schema, relationships)
     
     result = validator.validate_and_fix_sql(
@@ -678,7 +449,3 @@ def validator_agent_node(state):
         "validation_error": result.get("validation_error"),
         "correction_attempts": result.get("correction_attempts", 0)
     }
-
-
-# Export with both names for compatibility
-validator_agent = validator_agent_node

@@ -16,34 +16,70 @@ def normalize(t):
     return re.sub(r'[^a-zA-Z0-9 ]+', '', str(t)).lower().strip()
 
 def detect_time_filters(user_query: str):
+    """
+    FIXED: Only returns time filter if explicitly mentioned in query
+    Uses word boundary matching to avoid false positives like "markeplus" containing "mar"
+    """
     query = user_query.lower()
     today = datetime.today().date()
     
-    # Month detection
+    # Month detection - MUST be whole words or with "in" prefix
     months = {
-        'january': 1, 'jan': 1, 'february': 2, 'feb': 2, 'march': 3, 'mar': 3,
-        'april': 4, 'apr': 4, 'may': 5, 'june': 6, 'jun': 6,
-        'july': 7, 'jul': 7, 'august': 8, 'aug': 8, 'september': 9, 'sep': 9,
-        'october': 10, 'oct': 10, 'november': 11, 'nov': 11, 'december': 12, 'dec': 12
+        'january': 1, 'february': 2, 'march': 3, 'april': 4, 'may': 5, 'june': 6,
+        'july': 7, 'august': 8, 'september': 9, 'october': 10, 'november': 11, 'december': 12,
+        'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'jun': 6, 
+        'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12
     }
     
+    # Check for explicit month mentions using word boundaries
     for month_name, month_num in months.items():
-        if month_name in query:
+        # Create regex pattern for whole word match
+        # Matches: "in march", "march sales", "for march", but NOT "markeplus"
+        pattern = r'\b' + month_name + r'\b'
+        
+        if re.search(pattern, query):
             year = today.year
+            print(f"📅 Detected month: {month_name} {year}")
             return {
                 "time_range": [f"{year}-{month_num:02d}-01", f"{year}-{month_num:02d}-31"],
                 "month": month_num
             }
     
+    # Check for relative time periods (these are safe as they're full phrases)
     if "last 2 months" in query:
+        print("📅 Detected: last 2 months")
         return {"time_range": [str(today - timedelta(days=60)), str(today)]}
     if "last 3 months" in query:
+        print("📅 Detected: last 3 months")
         return {"time_range": [str(today - timedelta(days=90)), str(today)]}
     if "last month" in query:
+        print("📅 Detected: last month")
         return {"time_range": [str(today - timedelta(days=30)), str(today)]}
     if "last week" in query:
+        print("📅 Detected: last week")
         return {"time_range": [str(today - timedelta(days=7)), str(today)]}
+    if "this month" in query:
+        print("📅 Detected: this month")
+        month = today.month
+        year = today.year
+        return {
+            "time_range": [f"{year}-{month:02d}-01", f"{year}-{month:02d}-31"],
+            "month": month
+        }
+    if "this year" in query:
+        print("📅 Detected: this year")
+        year = today.year
+        return {"time_range": [f"{year}-01-01", f"{year}-12-31"]}
+    if re.search(r'\btoday\b', query):
+        print("📅 Detected: today")
+        return {"time_range": [str(today), str(today)]}
+    if re.search(r'\byesterday\b', query):
+        print("📅 Detected: yesterday")
+        yesterday = today - timedelta(days=1)
+        return {"time_range": [str(yesterday), str(yesterday)]}
     
+    # CRITICAL FIX: No time mentioned - explicitly state it
+    print("ℹ️  No time period mentioned - will query all available data")
     return {}
 
 def shortlist_candidates_with_scores(text, options, k=15, score_cutoff=60):
@@ -94,6 +130,8 @@ Examples:
 - "VH trading" → {{"intent": "query", "entities": {{"distributor": ["VH trading"]}}, "metrics": []}}
 - "takatak" → {{"intent": "query", "entities": {{"product": ["takatak"]}}, "metrics": []}}
 - "sales in may" → {{"intent": "query", "entities": {{}}, "metrics": ["sales"]}}
+
+CRITICAL: Do NOT infer or add time information. Only extract what's explicitly mentioned.
 
 IMPORTANT: ALWAYS include "intent", "metrics", and "entities" keys in your response.
 
@@ -225,9 +263,10 @@ def resolve_with_human_in_loop_pg(user_query, catalog, table_columns):
         print(f"⚠️ Warning: entities was {type(entities)}, converting to dict")
         entities = {}
     
+    # CRITICAL FIX: Only detect time filters if explicitly mentioned
     filters = detect_time_filters(user_query)
     
-    print(f"📝 Query intent: {intent}, metrics: {metrics}, filters: {filters}")
+    print(f"📝 Query intent: {intent}, metrics: {metrics}, filters: {filters if filters else 'None'}")
 
     resolved_entities = {}
     
